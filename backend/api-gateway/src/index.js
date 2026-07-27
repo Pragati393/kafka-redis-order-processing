@@ -45,11 +45,20 @@ const producer = kafka.producer({
   createPartitioner: Partitioners.LegacyPartitioner
 });
 
-// Redis subscriber setup
+// Redis subscriber setup (for real-time WebSocket broadcast)
 const redisSub = createClient({
   url: process.env.REDIS_URL || 'redis://localhost:6379'
 });
 redisSub.on('error', (err) => logger.error('Redis Sub Error:', { error: err.message }));
+
+// Redis client for caching order reads (cache-aside pattern)
+const redisCache = createClient({
+  url: process.env.REDIS_URL || 'redis://localhost:6379'
+});
+redisCache.on('error', (err) => logger.error('Redis Cache Error:', { error: err.message }));
+redisCache.connect().catch((err) => logger.error('Failed to connect Redis cache client:', { error: err.message }));
+
+const CACHE_TTL_SECONDS = 10;
 
 const topicToEventMap = {
   'order-created': 'orderCreated',
@@ -104,14 +113,29 @@ app.get("/health", (req, res) => {
   res.status(200).json({ status: "OK" });
 });
 
-// Get orders with optional status filter
+// Get orders with optional status filter (cache-aside pattern)
 app.get('/api/orders', async (req, res) => {
   try {
     const { status } = req.query;
-    const query = status ? { status: status.toUpperCase() } : {};
+    const statusKey = status ? status.toUpperCase() : 'ALL';
+    const cacheKey = `orders:${statusKey}`;
 
-    logger.info('Fetching orders:', {
-      status: status || 'ALL',
+    // Try cache first
+    const cached = await redisCache.get(cacheKey);
+    if (cached) {
+      logger.info('Orders served from cache:', { status: statusKey });
+      return res.json({
+        success: true,
+        orders: JSON.parse(cached),
+        fromCache: true
+      });
+    }
+
+    // Cache miss - query MongoDB
+    const query = status ? { status: statusKey } : {};
+
+    logger.info('Cache miss, fetching orders from MongoDB:', {
+      status: statusKey,
       query
     });
 
@@ -121,12 +145,16 @@ app.get('/api/orders', async (req, res) => {
 
     logger.info('Orders fetched successfully:', {
       count: orders.length,
-      status: status || 'ALL'
+      status: statusKey
     });
+
+    // Store in cache for next time
+    await redisCache.set(cacheKey, JSON.stringify(orders), { EX: CACHE_TTL_SECONDS });
 
     res.json({
       success: true,
-      orders
+      orders,
+      fromCache: false
     });
   } catch (error) {
     logger.error('Error fetching orders:', {
@@ -213,6 +241,11 @@ app.post('/api/orders', async (req, res) => {
       order: savedOrder.toJSON()
     });
 
+    // Invalidate caches since a new order was added
+    await redisCache.del('orders:ALL');
+    await redisCache.del('orders:PENDING');
+    logger.info('Invalidated order caches after new order creation');
+
     res.status(201).json({
       success: true,
       message: 'Order created successfully',
@@ -252,6 +285,7 @@ process.on('SIGTERM', async () => {
   try {
     await producer.disconnect();
     await redisSub.disconnect();
+    await redisCache.disconnect();
     await mongoose.connection.close();
     logger.info('Gracefully shutting down API Gateway');
     process.exit(0);
