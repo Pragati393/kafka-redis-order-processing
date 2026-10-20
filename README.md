@@ -1,310 +1,117 @@
-# Real-time Order Processing System with Kafka & Redis
+# Real-time Order Processing System (Kafka, Redis, MongoDB)
 
-A scalable, real-time order processing system built with microservices architecture, using Kafka for event streaming and MongoDB for data persistence. This system demonstrates advanced order management capabilities with real-time status updates, filtering, and comprehensive order tracking.
+An event-driven order processing system built from small Node.js services. Orders are created through a REST API, processed asynchronously via Kafka, cached and broadcast with Redis, stored in MongoDB, and shown live on a React dashboard over WebSockets.
 
-## 📸 Screenshots
+## Screenshots
 
-### Dashboard UI with Status Filtering
 ![Order Dashboard with Filtering](docs/images/dashboard2.png)
-*Enhanced order dashboard featuring status-based filtering, real-time updates, and detailed order tracking*
+*Dashboard with status filtering, live updates and order statistics*
 
-### Original Dashboard
-![Original Dashboard](docs/images/dashboard.png)
-*Real-time order dashboard showing statistics and recent orders*
-
-### API Gateway Logs
 ![API Gateway Console](docs/images/api_gateway_console.png)
-*API Gateway console showing structured logging with Winston*
+*API Gateway structured logging (Winston)*
 
-## 🏗 Architecture
+## Architecture
 
-- **API Gateway**: Node.js service handling incoming requests and WebSocket connections
-- **Kafka**: Message broker for reliable event streaming and order processing
-- **Redis**: Real-time updates and caching
-- **MongoDB**: Order data persistence with status tracking
-- **React Dashboard**: Real-time order monitoring with advanced filtering and statistics
+| Service | Role |
+|---|---|
+| **api-gateway** (Express, Socket.IO) | REST API, saves orders to MongoDB, publishes `order-created` to Kafka (via an outbox), serves cached reads, pushes live events to the dashboard |
+| **order-service** (Kafka consumer) | Consumes `order-created`, processes the order, updates MongoDB, publishes `order-processed` / `order-failed` |
+| **notification-service** (Kafka consumer) | Consumes all order topics and republishes them on a Redis pub/sub channel (`order-updates`) |
+| **frontend** (React, Material-UI) | Live dashboard with status filter and charts |
+| **Kafka** | Event backbone (3 topics, 3 partitions each, keyed by order ID) |
+| **Redis** | Pub/sub bridge from Kafka to WebSockets + cache-aside for order reads |
+| **MongoDB** | Order persistence |
 
-## 🔄 How It Works
+## How it works
 
-1. **Order Creation Flow**
-   - User submits an order through the React Dashboard
-   - API Gateway receives the order and:
-     - Saves it to MongoDB with 'PENDING' status
-     - Publishes an 'order-created' event to Kafka
-     - Notifies connected clients via WebSocket
+1. `POST /api/orders` saves the order as `PENDING` (with `eventPublished: false`), publishes `order-created` to Kafka, marks `eventPublished: true`, and emits `orderCreated` to connected clients.
+2. The order service consumes the event, processes the order (simulated work), sets the status to `PROCESSED` or `FAILED`, and publishes the result to Kafka.
+3. The notification service forwards every Kafka event to the Redis channel `order-updates`.
+4. The gateway subscribes to that channel, clears the cached order lists, and pushes the event to the dashboard over Socket.IO.
+5. `GET /api/orders?status=...` uses **cache-aside**: Redis first (10 s TTL, one key per status), MongoDB on a miss.
 
-2. **Order Processing Flow**
-   - Order Service consumes 'order-created' events from Kafka
-   - Processes the order and updates its status:
-     - On success: Updates status to 'PROCESSED'
-     - On failure: Updates status to 'FAILED'
-   - Emits appropriate WebSocket events ('orderProcessed' or 'orderFailed')
+## Reliability design
 
-3. **Real-time Updates**
-   - Dashboard maintains WebSocket connection to API Gateway
-   - Receives instant updates for:
-     - New orders (orderCreated event)
-     - Processed orders (orderProcessed event)
-     - Failed orders (orderFailed event)
-   - Updates UI in real-time without page refresh
+### 1. Outbox pattern: never lose an order event
+**Problem:** saving to MongoDB and publishing to Kafka are two different systems. If Kafka is down right after the save, the order exists but nobody is ever told to process it.
 
-4. **Data Persistence**
-   - All orders are stored in MongoDB
-   - Each order contains:
-     - Unique Order ID
-     - User ID
-     - Product details
-     - Quantity
-     - Status (PENDING/PROCESSED/FAILED)
-     - Timestamps (created, processed, failed)
+**Solution:** the order document has an `eventPublished` flag. It is saved together with the order in a single MongoDB write (one document write is atomic, so no multi-document transaction is needed). The gateway then publishes to Kafka and flips the flag to `true` only after Kafka accepts the message. A background **relay** runs every few seconds and publishes any order whose flag is still `false`.
 
-5. **Status Filtering**
-   - Dashboard provides real-time filtering by order status
-   - Filter options:
-     - ALL: Shows all orders
-     - PENDING: Shows only unprocessed orders
-     - PROCESSED: Shows successfully processed orders
-     - FAILED: Shows failed orders
-   - Filters are applied both to:
-     - Existing orders in the table
-     - New orders received via WebSocket
+- Kafka down: the API still returns `201`, the order waits with `eventPublished: false`, and the relay publishes it when Kafka is back.
+- The relay skips orders younger than a few seconds so it does not race with the normal request path.
+- It can occasionally publish the same event twice (for example, a crash after Kafka accepted it but before the flag was updated). That is acceptable because consumers are idempotent (next section).
 
-## 💻 System Implementation Details
+### 2. Idempotent processing: a duplicate message does no harm
+Kafka guarantees **at-least-once** delivery, so the same message can arrive twice (rebalance, retry, outbox re-send).
 
-### API Gateway Service
-- **Express.js Server Configuration**
-  - RESTful API endpoints for order management
-  - CORS enabled for frontend communication
-  - Structured logging with Winston
-  - Request validation middleware
+The order service only allows `PENDING -> PROCESSED/FAILED` **once**. It uses a conditional update, `findOneAndUpdate({ orderId, status: 'PENDING' }, ...)`, which MongoDB applies atomically. If the update matches nothing, someone already finished the order, so no second result event is published. There is also an early check to skip obvious duplicates and avoid wasted work.
 
-- **WebSocket Implementation**
-  - Socket.IO server integration
-  - Real-time event broadcasting
-  - Connection state management
-  - Client connection pooling
+### 3. Redis is an optimisation, never a dependency
+Reads try Redis first; if Redis is down, the error is caught and treated as a cache miss, so the API answers from MongoDB. The cache client uses `disableOfflineQueue`, so commands fail immediately instead of hanging until Redis returns. Writes and cache invalidation are best-effort. A short TTL (10 s) limits how stale data can get if an invalidation is missed.
 
-- **Kafka Producer Setup**
-  - Legacy partitioner configuration
-  - Message key strategy using Order ID
-  - Asynchronous message publishing
-  - Error handling and retries
+## Quick start (Docker)
 
-### Order Processing Service
-- **Kafka Consumer Configuration**
-  - Consumer group management
-  - Topic subscription handling
-  - Message deserialization
-  - Batch processing capabilities
+Requires Docker and Docker Compose.
 
-- **Order Processing Logic**
-  - Status transition management
-  - Timestamp tracking for each state
-  - Error boundary implementation
-  - Retry mechanism for failed orders
-
-- **Database Operations**
-  - Atomic updates with MongoDB
-  - Optimistic concurrency control
-  - Transaction management
-  - Index optimization
-
-### React Dashboard Architecture
-- **State Management**
-  - Real-time order state updates
-  - Optimistic UI updates
-  - Status filtering logic
-  - WebSocket reconnection handling
-
-- **Component Structure**
-  - Material-UI integration
-  - Responsive layout system
-  - Chart visualization with Recharts
-  - Custom hook implementations
-
-- **Event Handling**
-  - WebSocket event listeners
-  - Error boundary components
-  - Connection status monitoring
-  - Real-time data synchronization
-
-### Data Model Design
-- **Order Document Structure**
-  - Unique identifier generation
-  - Status enumeration
-  - Timestamp tracking
-  - Error message handling
-
-- **Schema Validation**
-  - Required field constraints
-  - Data type validation
-  - Enum value restrictions
-  - Custom validators
-
-### Key Technical Features
-
-1. **Event Sourcing Pattern**
-   - Orders flow through Kafka topics
-   - Each state change is an event
-   - Events are persisted and can be replayed
-   - Event-driven architecture benefits
-
-2. **Real-time Updates**
-   - Socket.IO for bidirectional communication
-   - Event-based architecture for real-time state updates
-   - Optimistic UI updates with WebSocket confirmation
-   - Connection state management
-
-3. **Error Handling**
-   - Failed orders are tracked with error messages
-   - Automatic status updates on failures
-   - Error events propagated to UI
-   - Retry mechanisms and circuit breakers
-
-4. **Data Consistency**
-   - MongoDB transactions for order updates
-   - Kafka exactly-once delivery semantics
-   - Optimistic locking for concurrent updates
-   - Data validation at multiple layers
-
-5. **Performance Optimizations**
-   - Kafka partitioning for parallel processing
-   - MongoDB indexes on frequently queried fields
-   - WebSocket connection pooling
-   - React memo and callback optimizations
-   - Batch processing capabilities
-   - Connection pooling
-   - Query optimization
-
-## 🚀 Features
-
-- Real-time order processing and status updates
-- Advanced order filtering (All, Pending, Processed, Failed)
-- Detailed order tracking with timestamps
-- Status-based color coding for better visibility
-- Mock order generation with Faker.js
-- Live order statistics and charts
-- WebSocket connection status monitoring
-- Scalable microservices architecture
-- Event-driven design with Kafka
-
-## 📋 Prerequisites
-
-- Node.js v18+
-- Docker and Docker Compose
-- npm or yarn
-
-## 🛠 Installation & Setup
-
-1. **Clone the repository**
-   ```bash
-   git clone <repository-url>
-   cd kafka-redis-microservices
-   ```
-
-2. **Start Infrastructure Services**
-   ```bash
-   docker-compose up -d
-   ```
-   This will start:
-   - Kafka & Zookeeper
-   - Redis
-   - MongoDB
-
-3. **Install API Gateway Dependencies**
-   ```bash
-   cd backend/api-gateway
-   npm install
-   ```
-
-4. **Install Frontend Dependencies**
-   ```bash
-   cd frontend
-   npm install
-   ```
-
-## 🚀 Running the Application
-
-1. **Start the API Gateway**
-   ```bash
-   cd backend/api-gateway
-   npm run dev
-   ```
-   The API Gateway will run on port 4000
-
-2. **Start the Frontend**
-   ```bash
-   cd frontend
-   npm start
-   ```
-   The React dashboard will run on port 3000
-
-3. **Access the Dashboard**
-   Open [http://localhost:3000](http://localhost:3000) in your browser
-
-## 🎮 Using the Dashboard
-
-1. **Generate Mock Orders**
-   - Use the "Generate Random Values" button to create random order data
-   - Click "Create Order" to submit the order
-   - Watch the real-time updates in the chart and table
-
-2. **Monitor Orders**
-   - View order statistics in the chart
-   - See detailed order information in the table
-   - Check WebSocket connection status
-
-## 🔧 Environment Variables
-
-### API Gateway (.env)
-```env
-PORT=4000
-KAFKA_BROKERS=localhost:9092
+```bash
+docker compose up --build
 ```
 
-### Frontend (.env)
-```env
-REACT_APP_API_URL=http://localhost:4000
+Then open **http://localhost:3000**. Click "Generate Random Values" and "Create Order", and watch orders move from PENDING to PROCESSED (or FAILED).
+
+The API is on http://localhost:4000 (`GET /health`, `GET /api/orders`, `POST /api/orders`).
+
+Stop with `docker compose down` (add `-v` to also delete the MongoDB data).
+
+### Try the failure scenarios
+
+```bash
+docker compose stop kafka          # create an order: still returns 201, stays PENDING
+docker compose start kafka         # within ~10 s the outbox relay publishes it and it gets processed
+
+docker compose stop redis          # GET /api/orders still works (served from MongoDB)
+docker compose stop order-service  # orders stay PENDING until it starts again
 ```
 
-## 🔍 Monitoring
+## Run locally without Docker for the apps
 
-- **Kafka**: Monitor topics and messages using Kafka UI or command-line tools
-- **MongoDB**: Use MongoDB Compass for database monitoring
-- **Redis**: Monitor real-time events using Redis CLI
+```bash
+docker compose up -d mongodb redis zookeeper kafka kafka-init   # infrastructure only
 
-## 🛟 Troubleshooting
+cd backend/api-gateway && npm install && npm run dev            # port 4000
+cd backend/order-service && npm install && npm run dev          # port 3005
+cd backend/notification-service && npm install && npm run dev   # port 3002
+cd frontend && npm install && npm start                         # port 3000
+```
 
-1. **Kafka Connection Issues**
-   - Ensure Kafka and Zookeeper are running: `docker-compose ps`
-   - Check Kafka logs: `docker-compose logs kafka`
+## Configuration
 
-2. **WebSocket Connection Issues**
-   - Verify API Gateway is running on port 4000
-   - Check browser console for connection errors
+| Variable | Used by | Default |
+|---|---|---|
+| `KAFKA_BROKER` | all backend services | `localhost:9092` |
+| `MONGODB_URI` | gateway, order-service | `mongodb://localhost:27017/order-management` |
+| `REDIS_URL` | gateway, notification-service | `redis://localhost:6379` |
+| `CORS_ORIGIN` | gateway | any origin (set it in production) |
+| `OUTBOX_INTERVAL_MS` | gateway | `5000` (how often the relay runs) |
+| `OUTBOX_GRACE_MS` | gateway | `5000` (relay ignores orders newer than this) |
+| `PROCESSING_DELAY_MS` | order-service | `2000` |
+| `FAILURE_RATE` | order-service | `0.1` (10% of orders fail so the FAILED path is visible in demos) |
+| `REACT_APP_API_URL` | frontend (build time) | `http://localhost:4000` |
 
-3. **MongoDB Connection Issues**
-   - Ensure MongoDB is running: `docker-compose ps`
-   - Check MongoDB logs: `docker-compose logs mongodb`
+## Known limitations & future work
 
-## 📚 Tech Stack
+- Processing is simulated (a timed delay with a configurable failure rate), not real business logic.
+- The outbox is a simple flag plus polling relay; a production system might use change streams or a dedicated outbox collection.
+- If the order service updates MongoDB but then fails to publish its result event, the dashboard may miss the live update until the next refresh (the same idea could be applied there).
+- No retry with backoff or dead-letter topic for failed messages yet.
+- No request validation library (Joi/Zod); order IDs are timestamp-based, so UUIDs would avoid collisions under heavy load.
+- No automated tests or CI pipeline yet.
+- Single-broker Kafka without auth; a production setup needs a replicated cluster and SASL/SSL.
 
-- **Backend**: Node.js, Express
-- **Frontend**: React, Material-UI, Recharts
-- **Message Broker**: Apache Kafka
-- **Cache**: Redis
-- **Database**: MongoDB
-- **Real-time**: Socket.IO
-- **Container**: Docker
+## Tech stack
 
-## 🤝 Contributing
+Node.js, Express, Socket.IO, KafkaJS, Redis, MongoDB (Mongoose), React, Material-UI, Recharts, Docker Compose.
 
-1. Fork the repository
-2. Create your feature branch
-3. Commit your changes
-4. Push to the branch
-5. Create a Pull Request
+## License
 
-## 📝 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+MIT

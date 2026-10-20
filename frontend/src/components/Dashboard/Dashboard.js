@@ -6,7 +6,7 @@ import OrderChart from './OrderChart';
 import MockOrderForm from '../MockOrderForm/MockOrderForm';
 import logger from '../../utils/logger';
 
-const API_URL = 'http://localhost:4000';
+const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:4000';
 
 const Dashboard = () => {
   const [orders, setOrders] = useState([]);
@@ -66,7 +66,11 @@ const Dashboard = () => {
     newSocket.on('orderCreated', (newOrder) => {
       logger.info('New order received', { orderId: newOrder.orderId });
       if (statusFilter === 'ALL' || statusFilter === newOrder.status) {
-        setOrders((prevOrders) => [newOrder, ...prevOrders]);
+        setOrders((prevOrders) =>
+          prevOrders.some((o) => o.orderId === newOrder.orderId)
+            ? prevOrders
+            : [newOrder, ...prevOrders]
+        );
       }
     });
 

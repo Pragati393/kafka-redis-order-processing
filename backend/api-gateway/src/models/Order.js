@@ -25,6 +25,13 @@ const orderSchema = new mongoose.Schema({
     enum: ['PENDING', 'PROCESSED', 'FAILED'],
     default: 'PENDING'
   },
+  // Outbox flag: false until the 'order-created' event has reached Kafka.
+  // It lives in the same document as the order, so "order saved" and
+  // "event still to be published" are written together in ONE atomic write.
+  eventPublished: {
+    type: Boolean,
+    default: false
+  },
   createdAt: {
     type: Date,
     default: Date.now
@@ -37,6 +44,7 @@ const orderSchema = new mongoose.Schema({
 orderSchema.index({ userId: 1 });
 orderSchema.index({ status: 1 });
 orderSchema.index({ createdAt: -1 });
+orderSchema.index({ eventPublished: 1, createdAt: 1 }); // used by the outbox relay
 
 const Order = mongoose.model('Order', orderSchema);
 
