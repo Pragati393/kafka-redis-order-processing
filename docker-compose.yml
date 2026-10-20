@@ -1,40 +1,120 @@
-version: '3.8'
-
 services:
-  # MongoDB
+  # ---------- Infrastructure ----------
   mongodb:
-    image: mongo:latest
+    image: mongo:7
     ports:
       - "27017:27017"
     volumes:
       - mongodb_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
-  # Redis
   redis:
-    image: redis:latest
+    image: redis:7-alpine
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
-  # Kafka
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
-    ports:
-      - "2181:2181"
 
   kafka:
     image: confluentinc/cp-kafka:7.5.0
     depends_on:
       - zookeeper
     ports:
-      - "9092:9092"
+      - "9092:9092"   # for tools running on your host machine
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      # Two listeners: containers use kafka:29092, your host uses localhost:9092
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server kafka:29092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+
+  # Creates the topics once Kafka is healthy, then exits
+  kafka-init:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command: |
+      "for t in order-created order-processed order-failed; do
+         kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic $$t --partitions 3 --replication-factor 1;
+       done"
+
+  # ---------- Application ----------
+  api-gateway:
+    build: ./backend/api-gateway
+    ports:
+      - "4000:4000"
+    environment:
+      PORT: 4000
+      MONGODB_URI: mongodb://mongodb:27017/order-management
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:29092
+      CORS_ORIGIN: http://localhost:3000
+      OUTBOX_INTERVAL_MS: 5000
+    depends_on:
+      mongodb: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
+    restart: on-failure
+
+  order-service:
+    build: ./backend/order-service
+    environment:
+      PORT: 3005
+      MONGODB_URI: mongodb://mongodb:27017/order-management
+      KAFKA_BROKER: kafka:29092
+      PROCESSING_DELAY_MS: 2000
+      FAILURE_RATE: 0.1
+    depends_on:
+      mongodb: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
+    restart: on-failure
+
+  notification-service:
+    build: ./backend/notification-service
+    environment:
+      PORT: 3002
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:29092
+    depends_on:
+      redis: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
+    restart: on-failure
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        REACT_APP_API_URL: http://localhost:4000
+    ports:
+      - "3000:80"
+    depends_on:
+      - api-gateway
 
 volumes:
   mongodb_data:

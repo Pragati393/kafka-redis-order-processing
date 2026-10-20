@@ -30,148 +30,88 @@ const producer = kafka.producer({
 });
 const consumer = kafka.consumer({ groupId: 'order-service-group' });
 
+const PROCESSING_DELAY_MS = parseInt(process.env.PROCESSING_DELAY_MS || '2000', 10);
+// Probability (0-1) that a simulated order fails, so the FAILED path is visible in demos.
+const FAILURE_RATE = parseFloat(process.env.FAILURE_RATE || '0.1');
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Kafka delivers at-least-once, so the SAME message can arrive twice.
+// Idempotency rule: an order may only move PENDING -> PROCESSED/FAILED ONCE.
+// We enforce it with a conditional update ({ status: 'PENDING' }), which MongoDB
+// applies atomically. Only the update that wins publishes the result event.
 async function processOrder(orderData) {
+  const { orderId } = orderData;
   try {
-    logger.info('Processing order:', {
-      orderId: orderData.orderId,
-      userId: orderData.userId,
-      product: orderData.product,
-      quantity: orderData.quantity
-    });
+    logger.info('Processing order:', { orderId });
 
-    // First, check if the order exists
-    let order = await Order.findOne({ orderId: orderData.orderId });
-
-    
+    const order = await Order.findOne({ orderId });
     if (!order) {
-      // If order doesn't exist, create it
-      order = new Order({
-        orderId: orderData.orderId,
-        userId: orderData.userId,
-        product: orderData.product,
-        quantity: orderData.quantity,
-        status: 'PENDING'
-      });
-      
-      logger.info('Creating new order in Order Service:', {
-        orderId: order.orderId,
-        status: order.status
-      });
-      
-      await order.save();
+      // The gateway saves the order BEFORE publishing the event, so this should not happen.
+      logger.warn('Order not found, ignoring event:', { orderId });
+      return;
     }
-    else{
-      logger.info('Order Found:', order.id);
+
+    // Quick check to avoid wasted work on an obvious duplicate.
+    if (order.status !== 'PENDING') {
+      logger.info('Order already handled, skipping duplicate:', { orderId, status: order.status });
+      return;
     }
-    
+
     // Simulate order processing
-    await new Promise(resolve => setTimeout(resolve, 2000));
-    
-    // Update order status in MongoDB
+    await sleep(PROCESSING_DELAY_MS);
+
+    if (Math.random() < FAILURE_RATE) {
+      throw new Error('Simulated processing failure (payment declined)');
+    }
+
+    // Atomic state change: matches ONLY if the order is still PENDING.
     const updatedOrder = await Order.findOneAndUpdate(
-      { orderId: orderData.orderId },
-      { 
-        status: 'PROCESSED',
-        processedAt: new Date()
-      },
+      { orderId, status: 'PENDING' },
+      { status: 'PROCESSED', processedAt: new Date() },
       { new: true }
     );
-    
+
     if (!updatedOrder) {
-      throw new Error(`Order not found: ${orderData.orderId}`);
+      // Someone else already finished this order, so do not publish a second event.
+      logger.info('Lost the race, order already handled:', { orderId });
+      return;
     }
-
-    logger.info('Order processed successfully:', {
-      orderId: updatedOrder.orderId,
-      status: updatedOrder.status,
-      processedAt: updatedOrder.processedAt
-    });
-
-    // Send to processed topic
-    const processedMessage = {
-      ...orderData,
-      status: 'PROCESSED',
-      processedAt: new Date().toISOString()
-    };
-
-    logger.debug('Sending processed order to Kafka:', {
-      topic: 'order-processed',
-      message: processedMessage
-    });
 
     await producer.send({
       topic: 'order-processed',
-      messages: [
-        {
-          key: orderData.orderId,
-          value: JSON.stringify(processedMessage)
-        }
-      ]
+      messages: [{
+        key: orderId,
+        value: JSON.stringify({ ...orderData, status: 'PROCESSED', processedAt: updatedOrder.processedAt.toISOString() })
+      }]
     });
-
-    logger.info('Order processed event sent to Kafka:', { 
-      orderId: orderData.orderId,
-      topic: 'order-processed'
-    });
+    logger.info('Order processed and event sent:', { orderId, topic: 'order-processed' });
   } catch (error) {
-    logger.error('Error processing order:', {
-      orderId: orderData.orderId,
-      error: error.message,
-      stack: error.stack
-    });
+    logger.error('Error processing order:', { orderId, error: error.message });
 
-    // Update order status to FAILED in case of error
     try {
+      // Same guard: only a PENDING order can become FAILED.
       const failedOrder = await Order.findOneAndUpdate(
-        { orderId: orderData.orderId },
-        { 
-          status: 'FAILED',
-          failedAt: new Date(),
-          error: error.message
-        },
+        { orderId, status: 'PENDING' },
+        { status: 'FAILED', failedAt: new Date(), error: error.message },
         { new: true }
       );
 
-      if (failedOrder) {
-        logger.info('Order status updated to FAILED:', {
-          orderId: failedOrder.orderId,
-          status: failedOrder.status,
-          error: failedOrder.error
-        });
+      if (!failedOrder) {
+        logger.info('Order not PENDING, no failure event sent:', { orderId });
+        return;
       }
-
-      const failedMessage = {
-        ...orderData,
-        status: 'FAILED',
-        error: error.message,
-        failedAt: new Date().toISOString()
-      };
-
-      logger.debug('Sending failed order to Kafka:', {
-        topic: 'order-failed',
-        message: failedMessage
-      });
 
       await producer.send({
         topic: 'order-failed',
-        messages: [
-          {
-            key: orderData.orderId,
-            value: JSON.stringify(failedMessage)
-          }
-        ]
+        messages: [{
+          key: orderId,
+          value: JSON.stringify({ ...orderData, status: 'FAILED', error: error.message, failedAt: failedOrder.failedAt.toISOString() })
+        }]
       });
-
-      logger.info('Order failed event sent to Kafka:', {
-        orderId: orderData.orderId,
-        topic: 'order-failed'
-      });
+      logger.info('Order failed event sent:', { orderId, topic: 'order-failed' });
     } catch (updateError) {
-      logger.error('Error updating failed order status:', {
-        orderId: orderData.orderId,
-        error: updateError.message,
-        stack: updateError.stack
-      });
+      logger.error('Error recording failed order:', { orderId, error: updateError.message });
     }
   }
 }

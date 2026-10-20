@@ -24,7 +24,7 @@ const consumer = kafka.consumer({ groupId: 'notification-service-group' });
 async function setup() {
   await redisClient.connect();
   await consumer.connect();
-  await consumer.subscribe({ topics: ['order-created', 'order-processed', 'order-failed'], fromBeginning: true });
+  await consumer.subscribe({ topics: ['order-created', 'order-processed', 'order-failed'], fromBeginning: false });
 
   await consumer.run({
     eachMessage: async ({ topic, partition, message }) => {

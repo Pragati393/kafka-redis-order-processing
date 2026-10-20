@@ -24,7 +24,7 @@ const PRODUCT_LIST = [
   'Printer'
 ];
 
-const API_URL = 'http://localhost:4000'; // Updated to use port 4000
+const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:4000';
 
 const MockOrderForm = ({ onOrderCreated }) => {
   const [order, setOrder] = useState({
